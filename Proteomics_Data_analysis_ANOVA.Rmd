@@ -1,0 +1,493 @@
+---
+title: "Proteomics Data"
+output: html_notebook
+---
+
+Analysis of proteomic data from septic patients
+
+```{r loading packages, echo=FALSE, message=FALSE}
+library(SomaDataIO)
+library(ggplot2)
+library(purrr)
+library(fs)
+library(ComplexHeatmap)
+library(circlize)
+library(WGCNA)
+library(tidyverse)
+library(Matrix)
+library(pheatmap)
+library(gridExtra)
+library(CorLevelPlot)
+```
+
+## Read in and preparation
+
+```{r data read in}
+input_dir = "/Users/fabianhernandez/Chevrier_Lab/Soma_Scan_New_Analysis/input"
+output_dir = "/Users/fabianhernandez/Chevrier_Lab/Soma_Scan_New_Analysis/output"
+
+soma_data = read_adat(path(input_dir,"SS-2450518_v4.1_ACDPlasma.anmlSMP.20240307.adat"))
+soma_data$SampleId = gsub("-",".",soma_data$SampleId)
+
+metadata = read.csv(path(input_dir, "metadata.csv")) %>%
+  mutate(Sepsis = factor(Sepsis, levels = c("1","0")),
+         Severe = factor(Severe, levels = c("1","0")),
+         Shock.Duration = factor(Shock.Duration, levels = c("Died","Prolonged","Short","No.shock")),
+         Outcome = factor(Outcome, levels = c("Died", "Survived")))
+```
+
+
+```{r data preparation}
+
+# center/scale
+cs = function(.x) {    # .x = numeric vector
+  out = .x - mean(.x)  # center
+  out / sd(.x)         # scale
+}
+
+# prepare data set for analysis
+cleanData = soma_data |>
+  filter(SampleType == "Sample") |>         # rm control samples
+  log10() |>                                # log10-transform (Math Generic)
+  modify_at(getAnalytes(soma_data), cs)  # center/scale analytes
+
+cleanData = left_join(x = cleanData, y = metadata, by = c("SampleId" = "Name"))
+
+annotation = getAnalyteInfo(cleanData) |>
+  select(AptName, SeqId, Target = TargetFullName, EntrezGeneSymbol, UniProt)
+
+#Normalize between 0 and 1
+
+perc = function(.x) {
+  .x/max(.x)
+}
+cellkbdata = soma_data %>%
+  filter(SampleType == "Sample") %>%
+  modify_at(getAnalytes(soma_data), perc) 
+```
+
+## PCA
+
+```{r PCA}
+pca = cleanData %>% select(getAnalytes(cleanData)) %>% `colnames<-`(annotation$EntrezGeneSymbol) %>%
+  prcomp(center = T, scale. = T)
+
+#Elbow plot
+plot(x = c(1:55),
+     y =(pca$sdev^2/sum(pca$sdev^2))*100,
+     xlab = "Principal component",
+     ylab = "% of variance explained by PC") 
+
+```
+```{r}
+#Match the order of rows in the cleanData file to the metadata file, to label correctly the pca
+pca_res = metadata %>% arrange(match(Name, cleanData$SampleId)) %>% bind_cols(as_tibble(pca$x))
+  
+ggplot(pca_res, aes(PC1, PC2, color = Organism)) +
+    scale_color_manual(values = c("#0ad2ff","#2962ff","#9500ff",
+                                  "#ff0059","#ff8c00","#b4e600","#0fffdb")) +
+    geom_point(size = 2) +
+    theme_classic()
+```
+
+
+```{r}
+pca_loading_plot <- function(pca,pc,num_genes=20){
+  
+  # create tibble for ggplot
+  loading_tb <- tibble(gene=rownames(pca$rotation),
+                       loading=pca$rotation[,pc])
+  
+  # modify tibble so (1) the top num_genes loadings are selected, and (2)
+  # the genes are factored by loading weight.
+  loading_tb <- loading_tb %>% 
+    arrange(desc(abs(loading))) %>% 
+    head(num_genes) %>%
+    arrange(loading) %>% 
+    mutate(gene=factor(gene,levels=gene))
+  
+  ggplot(loading_tb,aes(x=gene,y=loading)) +
+    geom_bar(stat="identity") +
+    coord_flip() +
+    theme_classic() +
+    xlab(str_c("PC",pc," loading")) +
+    theme(axis.title.y=element_blank())
+}
+
+pca_loading_plot(pca,1)
+```
+
+
+## Anova analyses (multigroup)
+
+```{r Anova for different groups}
+
+aov_tbl = annotation |>
+  mutate(
+    formula   = map(AptName, ~ as.formula(paste(.x, "~ Condition + Age + Gender"))), # create formula
+    aov_model = map(formula, ~ stats::aov(.x, data = cleanData)),  # fit ANOVA-models
+    aov_smry  = map(aov_model, summary) |> map(1L),      # summary() method
+    F.stat    = map(aov_smry, "F value") |> map_dbl(1L), # pull out F-statistic
+    p.value   = map(aov_smry, "Pr(>F)") |> map_dbl(1L),  # pull out p-values
+    fdr       = p.adjust(p.value, method = "BH")         # FDR multiple testing
+  ) |>
+  arrange(p.value) |>            # re-order by `p-value`
+  mutate(rank = row_number())    # add numeric ranks
+
+target_map = head(aov_tbl, 13L) |>     # mapping table
+  select(AptName, Target, EntrezGeneSymbol)               # SeqId -> Target
+
+plot_condition = cleanData |>
+  select(Condition, target_map$AptName) |>    # top x analytes
+  pivot_longer(cols = -Condition, names_to = "AptName", values_to = "RFU") |>
+  left_join(target_map, by = "AptName")
+
+
+plot_condition |>
+  ggplot(aes(x = RFU, fill = Condition)) +
+  geom_density(linetype = 0, alpha = 0.7) +
+  scale_fill_manual(values = c("#e63946", "#f1faee", "#a8dadc", "#457b9d", "#1d3557")) +
+  facet_wrap(~ EntrezGeneSymbol, ncol = 3) +
+  ggtitle("Probability Density of Top Analytes by ANOVA") +
+  labs(y = "Density") +
+  theme(plot.title = element_text(size = 21, face = "bold"),
+        axis.title.x = element_text(size = 14),
+        axis.title.y = element_text(size = 14),
+        legend.position = "top"
+  )
+```
+```{r box plots}
+plot_condition |>
+  ggplot(aes(x = Condition, y = RFU, fill = Condition)) +
+  geom_boxplot(alpha = 0.5, outlier.shape = NA) +
+  scale_fill_manual(values = c("#24135F", "#00A499", "#e63946", "#f1faee", "#f77f00")) +
+  geom_jitter(shape = 16, width = 0.1, alpha = 0.5) +
+  facet_wrap(~ EntrezGeneSymbol, ncol = 3) +
+  ggtitle("Boxplots of Top Analytes by ANOVA") +
+  labs(y = "log10(RFU)") +
+  theme(plot.title = element_text(size = 21, face = "bold"),
+        axis.title.x = element_text(size = 14),
+        axis.title.y = element_text(size = 14),
+        legend.position = "top"
+  )
+
+```
+```{r Comparison only pathogens}
+just_pathogens = cleanData %>% filter(Condition != "Healthy")
+
+aov_tbl_pathogens = annotation |>
+  mutate(
+    formula   = map(AptName, ~ as.formula(paste(.x, "~ Organism + Age + Gender"))), # create formula
+    aov_model = map(formula, ~ stats::aov(.x, data = just_pathogens)),  # fit ANOVA-models
+    aov_smry  = map(aov_model, summary) |> map(1L),      # summary() method
+    F.stat    = map(aov_smry, "F value") |> map_dbl(1L), # pull out F-statistic
+    p.value   = map(aov_smry, "Pr(>F)") |> map_dbl(1L),  # pull out p-values
+    fdr       = p.adjust(p.value, method = "BH")         # FDR multiple testing
+  ) |>
+  arrange(p.value) |>            # re-order by `p-value`
+  mutate(rank = row_number())    # add numeric ranks
+
+target_map_pathogens = head(aov_tbl_pathogens, 12L) |>     # mapping table
+  select(AptName, Target, EntrezGeneSymbol)               # SeqId -> Target
+
+plot_condition_pathogens = just_pathogens |>
+  select(Condition, target_map_pathogens$AptName) |>    # top x analytes
+  pivot_longer(cols = -Condition, names_to = "AptName", values_to = "RFU") |>
+  left_join(target_map_pathogens, by = "AptName")
+
+
+plot_condition_pathogens |>
+  ggplot(aes(x = RFU, fill = Condition)) +
+  geom_density(linetype = 0, alpha = 0.7) +
+  scale_fill_manual(values = c("#e63946", "#f1faee", "#a8dadc", "#457b9d", "#1d3557")) +
+  facet_wrap(~ EntrezGeneSymbol, ncol = 3) +
+  ggtitle("Probability Density of Top Analytes by ANOVA") +
+  labs(y = "Density") +
+  theme(plot.title = element_text(size = 21, face = "bold"),
+        axis.title.x = element_text(size = 14),
+        axis.title.y = element_text(size = 14),
+        legend.position = "top"
+  )
+
+```
+
+## Two groups comparison
+
+```{r t test comparison}
+
+t_tests_sepsis = annotation |>
+  mutate(
+    formula = map(AptName, ~ as.formula(paste(.x, "~ Sepsis"))), # create formula
+    t_test  = map(formula, ~ stats::t.test(.x, data = cleanData)),  # fit t-tests
+    t_stat  = map_dbl(t_test, "statistic"),            # pull out t-statistic
+    p.value = map_dbl(t_test, "p.value"),              # pull out p-values
+    fdr     = p.adjust(p.value, method = "BH")         # FDR for multiple testing
+  ) |>
+  arrange(p.value) |>            # re-order by `p-value`
+  mutate(rank = row_number())    # add numeric ranks
+
+target_map_t = head(t_tests_sepsis, 12L) |>     # mapping table
+  select(AptName, Target, EntrezGeneSymbol)   # SeqId -> Target
+
+plot_tbl_t = soma_data |>
+  left_join(metadata, 
+                by = c("SampleId" = "Name")) |>    # plot non-center/scale data
+  filter(SampleType == "Sample") |>     # rm control samples
+  log10() |>                            # log10-transform for plotting
+  select(Sepsis, target_map_t$AptName) |>    # top 12 analytes
+  pivot_longer(cols = -Sepsis, names_to = "AptName", values_to = "RFU") |>
+  left_join(target_map_t, by = "AptName")
+  
+
+plot_tbl_t |>
+  ggplot(aes(x = Sepsis, y = RFU, fill = Sepsis)) +
+  geom_boxplot(alpha = 0.5, outlier.shape = NA) +
+  scale_fill_manual(values = c("#24135F", "#00A499")) +
+  geom_jitter(shape = 16, width = 0.1, alpha = 0.5) +
+  facet_wrap(~ EntrezGeneSymbol, ncol = 3) +
+  ggtitle("Boxplots of Top Analytes by t-test") +
+  labs(y = "log10(RFU)") +
+  theme(plot.title = element_text(size = 21, face = "bold"),
+        axis.title.x = element_text(size = 14),
+        axis.title.y = element_text(size = 14),
+        legend.position = "top"
+  )
+
+```
+```{r t test with only pathogens}
+just_pathogens = just_pathogens %>% mutate(Candida = as.factor(ifelse(Organism == "Candida", 1,0)),
+                                           COVID = as.factor(ifelse(Organism == "COVID", 1,0)),
+                                           Ecoli = as.factor(ifelse(Organism == "E.coli", 1,0)),
+                                           Staph = as.factor(ifelse(Organism == "S.aureus", 1,0)),
+                                           Strep = as.factor(ifelse(Organism == "Streptococcus", 1,0)),
+                                           Klebsiella = as.factor(ifelse(Organism == "Klebsiella", 1,0)),
+                                           GramPos = as.factor(ifelse(Condition == "GramPositive", 1,0)),
+                                           GramNeg = as.factor(ifelse(Condition == "GramNegative", 1,0)))
+
+t_tests_pathogen = annotation |>
+  mutate(
+    formula = map(AptName, ~ as.formula(paste(.x, "~ Outcome"))), # create formula
+    t_test  = map(formula, ~ stats::t.test(.x, data = just_pathogens)),  # fit t-tests
+    t_stat  = map_dbl(t_test, "statistic"),            # pull out t-statistic
+    p.value = map_dbl(t_test, "p.value"),              # pull out p-values
+    fdr     = p.adjust(p.value, method = "BH")         # FDR for multiple testing
+  ) |>
+  arrange(p.value) |>            # re-order by `p-value`
+  mutate(rank = row_number())    # add numeric ranks
+
+target_map_t_pathogen = head(t_tests_pathogen, 12L) |>     # mapping table
+  select(AptName, Target, EntrezGeneSymbol)   # SeqId -> Target
+
+plot_tbl_t_pathogen = soma_data |>
+  left_join(metadata, 
+                by = c("SampleId" = "Name")) |>    # plot non-center/scale data
+  filter(SampleType == "Sample") |>     # rm control samples
+  log10() |>                            # log10-transform for plotting
+  select(Sepsis, target_map_t$AptName) |>    # top 12 analytes
+  pivot_longer(cols = -Sepsis, names_to = "AptName", values_to = "RFU") |>
+  left_join(target_map_t, by = "AptName")
+  
+
+plot_tbl_t_pathogen |>
+  ggplot(aes(x = Sepsis, y = RFU, fill = Sepsis)) +
+  geom_boxplot(alpha = 0.5, outlier.shape = NA) +
+  scale_fill_manual(values = c("#24135F", "#00A499")) +
+  geom_jitter(shape = 16, width = 0.1, alpha = 0.5) +
+  facet_wrap(~ EntrezGeneSymbol, ncol = 3) +
+  ggtitle("Boxplots of Top Analytes by t-test") +
+  labs(y = "log10(RFU)") +
+  theme(plot.title = element_text(size = 21, face = "bold"),
+        axis.title.x = element_text(size = 14),
+        axis.title.y = element_text(size = 14),
+        legend.position = "top"
+  )
+```
+
+
+## Heatmaps
+
+```{r ANOVA heatmap}
+#Take the proteins whose FDR < 0.05 in the ANOVA
+sig_analytes = aov_tbl %>% filter(fdr < 0.05) %>% select(AptName, EntrezGeneSymbol) 
+aov_hm = cleanData %>% select(SampleId, sig_analytes$AptName) %>% remove_rownames() %>% column_to_rownames("SampleId") %>% `colnames<-`(sig_analytes$EntrezGeneSymbol) %>% 
+  t()
+
+#Metadata ordered by sofa score and organism
+ordered_metadata = metadata %>% mutate(Organism = factor(Organism, 
+         levels = c("Healthy","Candida","COVID","E.coli","Klebsiella","S.aureus","Streptococcus"))) %>%
+  group_by(Organism) %>% arrange(SOFA, .by_group = T) %>%
+  as.data.frame()
+  
+
+aov_hm = aov_hm[,ordered_metadata$Name] #Order labels of the dataframe based on the ordered metadata
+colnames(aov_hm) = ordered_metadata$Organism
+
+highlighted = unlist(map(c("LTA|LTB","PLA2G2D","FGF9","COL11A2","EGFR",
+                          "FGF1","IFNGR2","C1QTNF9","OIT3","CILP",
+                          "MATN3","ALKAL2","HNRNPAB2B1","VEGFC", "BCL2",
+                          "GARS1","HCLS1","HSP90AB1","CPN1","HSP90AA1"), 
+                       ~which(rownames(aov_hm,) == .)))
+
+hm = Heatmap(aov_hm,
+        name = "log10(Normalized RFU)",
+        col = colorRamp2(c(-3, 0, 3), c('blue', 'white', 'red'), space = 'RGB'),
+        show_row_names = F,
+        show_column_names = F,
+        cluster_rows = T,
+        cluster_columns = F,
+        show_row_dend = F,
+        show_column_dend = F,
+        row_km = 7,
+        column_split = ordered_metadata[,11],
+        column_title = NULL,
+        use_raster = T,
+        border = T,
+        top_annotation = HeatmapAnnotation(type = anno_block(gp = gpar(fill = 1:7),
+                                          labels = unique(ordered_metadata[,11]),
+                                          labels_gp = gpar(col = "white", fontsize = 8)),
+                                          SOFA = anno_points(ordered_metadata[,3])),
+        right_annotation = rowAnnotation(highlight = anno_mark(at = highlighted, 
+                          labels = c("LTA|LTB","PLA2G2D","FGF9","COL11A2","EGFR",
+                          "FGF1","IFNGR2","C1QTNF9","OIT3","CILP",
+                          "MATN3","ALKAL2","HNRNPAB2B1","VEGFC", "BCL2",
+                          "GARS1","HCLS1","HSP90AB1","CPN1","HSP90AA1"))),
+       
+        row_title = paste(as.character(length(sig_analytes$AptName)), "proteins")
+                  )
+# png(file=path(output_dir,"heatmap_aov_loadings_label.png"), 
+#     width = 300, height = 200, units = "mm",
+#     res = 1200)
+# draw(hm)
+# dev.off()
+
+hm
+```
+
+```{r t test heatmap}
+#Take the proteins whose FDR < 0.05 in the ANOVA
+sig_analytes_t = t_tests_sepsis %>% filter(fdr < 0.05) %>% select(AptName, EntrezGeneSymbol) 
+ttest_hm = cleanData %>% select(SampleId, sig_analytes_t$AptName) %>% remove_rownames() %>% column_to_rownames("SampleId") %>% `colnames<-`(sig_analytes_t$EntrezGeneSymbol) %>% 
+  t()
+
+ttest_hm = ttest_hm[,ordered_metadata$Name] #Order labels of the dataframe based on the ordered metadata
+
+highlighted = unlist(map(c("LTA|LTB","PLA2G2D","FGF9","COL11A2","EGFR",
+                          "FGF1","IFNGR2","C1QTNF9","OIT3","CILP",
+                          "MATN3","ALKAL2","HNRNPAB2B1","VEGFC", "BCL2",
+                          "GARS1","HCLS1","HSP90AB1","CPN1","HSP90AA1"), 
+                       ~which(rownames(ttest_hm,) == .)))
+
+hm_t = Heatmap(ttest_hm,
+        name = "log10(Normalized RFU)",
+        col = colorRamp2(c(-3, 0, 3), c('blue', 'white', 'red'), space = 'RGB'),
+        show_row_names = F,
+        show_column_names = F,
+        cluster_rows = T,
+        cluster_columns = F,
+        show_row_dend = F,
+        show_column_dend = F,
+        row_km = 5,
+        column_split = ordered_metadata[,11],
+        column_title = NULL,
+        use_raster = T,
+        border = T,
+        top_annotation = HeatmapAnnotation(type = anno_block(gp = gpar(fill = 1:7),
+                                          labels = unique(ordered_metadata[,11]),
+                                          labels_gp = gpar(col = "white", fontsize = 8)),
+                                          SOFA = anno_points(ordered_metadata[,3])),
+        right_annotation = rowAnnotation(highlight = anno_mark(at = highlighted, 
+                          labels = c("LTA|LTB","PLA2G2D","FGF9","COL11A2","EGFR",
+                          "FGF1","IFNGR2","C1QTNF9","OIT3","CILP",
+                          "MATN3","ALKAL2","HNRNPAB2B1","VEGFC", "BCL2",
+                          "GARS1","HCLS1","HSP90AB1","CPN1","HSP90AA1"))),
+       
+        row_title = paste(as.character(length(sig_analytes$AptName)), "proteins")
+                  )
+png(file=path(output_dir,"heatmap_ttest_loadings_label.png"), 
+    width = 300, height = 200, units = "mm",
+    res = 1200)
+draw(hm_t)
+dev.off()
+
+```
+
+## Network Analysis
+
+```{r}
+
+protein_data = cleanData %>% select(SampleId, annotation$AptName) %>% remove_rownames() %>% column_to_rownames("SampleId") %>% `colnames<-`(annotation$EntrezGeneSymbol)
+
+protein_data_p = cleanData %>% select(SampleId, annotation$AptName) %>%
+  filter(SampleId %in% metadata[metadata$Sepsis == 1,1]) %>% remove_rownames() %>%
+  column_to_rownames("SampleId") %>% `colnames<-`(annotation$EntrezGeneSymbol)
+#Choose a set of soft-thresholding powers. These are the powers to which the similarity matrix will be powered in order to make it closer to that of a scale-free network (adjacency matrix)
+thr_power = c(c(1:10), seq(from=12, to=20, by=2))
+
+#Call the network topology analysis function
+sft = pickSoftThreshold(protein_data, 
+                        powerVector = thr_power,
+      #In a signed network genes are only similar if they are positively correlated. Genes with negative correlation are          considered dissimilar. In an unsigned network, genes are similar if the magnitude of the association is high,               regardless of the direction
+                        networkType = "signed", 
+                        verbose = 5)
+
+a1 = ggplot(sft$fitIndices, aes(Power, SFT.R.sq, label = Power)) +
+  geom_point() +
+  geom_text(nudge_y = 0.1) +
+  labs(x='Power', y='Scale free topology model fit, signed R^2') +
+  geom_hline(yintercept = 0.8, color = 'red') +
+  theme_classic()
+
+a2 = ggplot(sft$fitIndices, aes(Power, mean.k., label = Power)) +
+  geom_point() +
+  geom_text(nudge_y = 50) +
+  labs(x='Power', y='Mean Conectivity') +
+  theme_classic()
+
+grid.arrange(a1, a2, nrow = 2) #10th power gives good correlation and mean connectivity 
+```
+
+```{r}
+soft_power = 10
+
+bwnet = blockwiseModules(protein_data,     #Normalized count matrix
+                         maxBlockSize = 2000,  #If less than the number of genes it will break the analysis in parts
+                         TOMType = 'signed',
+                         power = soft_power,
+                         mergeCutHeight = 0.25, 
+                         numericLabels = F,
+                         randomSeed = 1234, 
+                         verbose = F, 
+                         deepSplit = 4) #deepSplit is related to the size of the module, the lower the value, the higher the number of genes in each module
+
+module_eigengenes = bwnet$MEs #Eigengenes are the first component of the PCA of that module, it is the representative expression pattern of that module
+
+table(bwnet$colors)
+
+plotDendroAndColors(dendro=bwnet$dendrograms[[1]],colors=bwnet$colors,
+                    groupLabels= "Module colors", dendroLabels = F, addGuide = T,
+                    hang=0.03, guideHang = 0.05)
+```
+```{r correlation heatmap}
+traits = metadata %>% mutate(Covid = as.factor(ifelse(grepl('COVID', Organism),1,0)),
+                    GramPos = as.factor(ifelse(grepl('GramPositive', Condition),1,0)),
+                    GramNeg = as.factor(ifelse(grepl('GramNegative', Condition),1,0)),
+                    Candida = as.factor(ifelse(grepl('Candida', Organism),1,0)),
+                    Ecoli = as.factor(ifelse(grepl('E.coli', Organism),1,0)),
+                    Klebsiella = as.factor(ifelse(grepl('Klebsiella', Organism),1,0)),
+                    Strep = as.factor(ifelse(grepl('Streptococcus', Organism),1,0)),
+                    Saureus = as.factor(ifelse(grepl('S.aureus', Organism),1,0)),
+                    Alive = as.factor(ifelse(grepl('Survived', Outcome),1,0)),
+                    Gender = factor(Gender, levels = c("F","M"))) %>%
+  select(c(4,5,12:21))
+  #select(c(12:21))
+rownames(traits) = metadata$Name
+
+cor.heatmap.data = merge(module_eigengenes, traits, by = "row.names") %>% column_to_rownames("Row.names")
+
+CorLevelPlot(cor.heatmap.data,
+             x=names(cor.heatmap.data)[13:24],
+             y=names(cor.heatmap.data)[1:12],
+             col = c("#4477AA", "#77AADD","#FFFFFF","#EE9988","#BB4444"))
+```
+
+
